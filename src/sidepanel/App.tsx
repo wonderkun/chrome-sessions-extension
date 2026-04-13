@@ -2,10 +2,12 @@ import {
   BookmarkPlus,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Eraser,
   ExternalLink,
   Folder,
   FolderInput,
+  GripVertical,
   RefreshCw,
   Trash2,
 } from "lucide-react";
@@ -29,7 +31,7 @@ import {
   saveSessions,
 } from "../lib/storage";
 import type { Group, Session } from "../lib/types";
-import { UNGROUPED_ID } from "../lib/types";
+import { DEFAULT_GROUPS, UNGROUPED_ID } from "../lib/types";
 import {
   EXTENSION_PREFS_STORAGE_KEY,
   type ExtensionPrefs,
@@ -38,6 +40,9 @@ import {
   saveExtensionPrefs,
 } from "../lib/prefs";
 import { getActiveTab, openOrRefreshSession } from "../lib/tabs";
+
+/** HTML5 DnD：会话拖到分组用 */
+const MIME_SESSION = "application/account-session";
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -59,11 +64,21 @@ export function App() {
     () => new Set(),
   );
   const foldersBootstrappedRef = useRef(false);
+  /** 上一次已知的分组 id 集合，用于仅在「新增分组」时自动展开，避免重排/刷新把已折叠的组全打开 */
+  const prevGroupIdsRef = useRef<Set<string> | null>(null);
   const [autoApplyCookies, setAutoApplyCookies] = useState(true);
   /** 双击标题内联编辑 */
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
   const [titleDraft, setTitleDraft] = useState("");
   const ignoreNextTitleBlurRef = useRef(false);
+  /** 会话拖入分组时高亮目标 */
+  const [sessionDropTargetId, setSessionDropTargetId] = useState<string | null>(
+    null,
+  );
+  /** 内联确认删除分组（含组内会话），仅同时处理一个 */
+  const [groupDeletePromptId, setGroupDeletePromptId] = useState<string | null>(
+    null,
+  );
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -95,7 +110,7 @@ export function App() {
       area: string,
     ) => {
       if (area !== "local") return;
-      if (changes.sessions_v1) void refresh();
+      if (changes.sessions_v1 || changes.groups_v1) void refresh();
       if (changes[EXTENSION_PREFS_STORAGE_KEY]) {
         const nv = changes[EXTENSION_PREFS_STORAGE_KEY]
           .newValue as ExtensionPrefs | undefined;
@@ -110,21 +125,26 @@ export function App() {
 
   useEffect(() => {
     if (loading) return;
+    const ids = new Set(groups.map((g) => g.id));
     setExpandedGroupIds((prev) => {
       if (!foldersBootstrappedRef.current) {
         foldersBootstrappedRef.current = true;
+        prevGroupIdsRef.current = new Set(ids);
         return new Set(
           groups.filter((g) => g.id !== UNGROUPED_ID).map((g) => g.id),
         );
       }
-      let changed = false;
+      const prior = prevGroupIdsRef.current ?? new Set<string>();
       const next = new Set(prev);
-      for (const g of groups) {
-        if (!next.has(g.id)) {
-          next.add(g.id);
+      let changed = false;
+      for (const id of ids) {
+        if (id === UNGROUPED_ID) continue;
+        if (!prior.has(id)) {
+          next.add(id);
           changed = true;
         }
       }
+      prevGroupIdsRef.current = new Set(ids);
       return changed ? next : prev;
     });
   }, [loading, groups]);
@@ -402,18 +422,66 @@ export function App() {
     showToast(`已添加分组「${name}」`);
   };
 
-  const onDeleteGroup = async (g: Group) => {
+  const cancelDeleteGroupPrompt = () => setGroupDeletePromptId(null);
+
+  const confirmDeleteGroup = async (g: Group) => {
     if (g.id === UNGROUPED_ID) return;
-    if (!confirm(`删除分组「${g.name}」？其中会话将移到「未分组」。`)) return;
-    const nextS = sessions.map((s) =>
-      s.groupId === g.id ? { ...s, groupId: UNGROUPED_ID } : s,
-    );
+    const inGroup = sessions.filter((s) => s.groupId === g.id);
+    const removeIds = new Set(inGroup.map((s) => s.id));
+    const nextS = sessions.filter((s) => s.groupId !== g.id);
     const nextG = groups.filter((x) => x.id !== g.id);
+    setGroupDeletePromptId(null);
+    if (editingTitleId && removeIds.has(editingTitleId)) {
+      setEditingTitleId(null);
+      setTitleDraft("");
+    }
+    setExpandedSessionIds((prev) => {
+      const next = new Set(prev);
+      for (const id of removeIds) next.delete(id);
+      return next;
+    });
     setSessions(nextS);
     setGroups(nextG);
     await saveSessions(nextS);
     await saveGroups(nextG);
-    showToast("分组已删除");
+    setExpandedGroupIds((prev) => {
+      const next = new Set(prev);
+      next.delete(g.id);
+      return next;
+    });
+    const n = inGroup.length;
+    showToast(
+      n > 0 ? `已删除分组「${g.name}」及 ${n} 条会话` : `已删除空分组「${g.name}」`,
+    );
+  };
+
+  const moveSessionToGroup = async (sessionId: string, groupId: string) => {
+    const gid = ensureGroupId(groupId, groups);
+    const gname = groups.find((x) => x.id === gid)?.name ?? "未分组";
+    const next = sessions.map((s) =>
+      s.id === sessionId ? { ...s, groupId: gid } : s,
+    );
+    setSessions(next);
+    await saveSessions(next);
+    showToast(`已移到「${gname}」`);
+  };
+
+  const moveNamedGroup = async (groupId: string, dir: "up" | "down") => {
+    const ung =
+      groups.find((g) => g.id === UNGROUPED_ID) ?? DEFAULT_GROUPS[0];
+    const named = groups.filter((g) => g.id !== UNGROUPED_ID);
+    const i = named.findIndex((g) => g.id === groupId);
+    if (i < 0) return;
+    const j = dir === "up" ? i - 1 : i + 1;
+    if (j < 0 || j >= named.length) return;
+    const copy = [...named];
+    const a = copy[i]!;
+    const b = copy[j]!;
+    copy[i] = b;
+    copy[j] = a;
+    const next = [ung, ...copy];
+    setGroups(next);
+    await saveGroups(next);
   };
 
   const finishTitleEdit = (sessionId: string, prevTitle: string) => {
@@ -448,6 +516,23 @@ export function App() {
         className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm dark:border-slate-800/80 dark:bg-slate-950/50 dark:shadow-none"
       >
         <div className="flex items-stretch gap-0">
+          <span
+            className="flex shrink-0 cursor-grab touch-none items-center justify-center px-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 active:cursor-grabbing dark:hover:bg-slate-800/50 dark:hover:text-slate-400"
+            draggable
+            title="拖到分组标题上移动"
+            role="button"
+            tabIndex={0}
+            onDragStart={(e) => {
+              e.dataTransfer.setData(MIME_SESSION, s.id);
+              e.dataTransfer.effectAllowed = "move";
+            }}
+            onDragEnd={() => setSessionDropTargetId(null)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") e.preventDefault();
+            }}
+          >
+            <GripVertical className="size-4" aria-hidden />
+          </span>
           <button
             type="button"
             onClick={() => toggleSessionDetail(s.id)}
@@ -755,42 +840,186 @@ export function App() {
             </p>
           </div>
         )}
-        {ungroupedList.length > 0 && (
-          <div className="space-y-1.5">
-            {ungroupedList.map(renderSessionCard)}
-          </div>
+
+        {sessions.length > 0 && (
+          <section
+            className={`rounded-xl transition-colors ${
+              sessionDropTargetId === UNGROUPED_ID
+                ? "bg-sky-50/90 ring-2 ring-sky-500/50 dark:bg-sky-950/25 dark:ring-sky-500/40"
+                : ""
+            }`}
+            onDragOver={(e) => {
+              if (e.dataTransfer.types.includes(MIME_SESSION)) {
+                e.preventDefault();
+              }
+            }}
+            onDragEnter={(e) => {
+              if (e.dataTransfer.types.includes(MIME_SESSION)) {
+                setSessionDropTargetId(UNGROUPED_ID);
+              }
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setSessionDropTargetId((cur) =>
+                  cur === UNGROUPED_ID ? null : cur,
+                );
+              }
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setSessionDropTargetId(null);
+              const sid = e.dataTransfer.getData(MIME_SESSION);
+              if (sid) void moveSessionToGroup(sid, UNGROUPED_ID);
+            }}
+          >
+            <p className="mb-1.5 px-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-500">
+              未分组
+              <span className="ml-1.5 font-normal normal-case text-slate-400 dark:text-slate-600">
+                拖入会话可移出命名分组
+              </span>
+            </p>
+            <div className="space-y-1.5">
+              {ungroupedList.length > 0 ? (
+                ungroupedList.map(renderSessionCard)
+              ) : (
+                <p className="rounded-lg border border-dashed border-slate-200 py-6 text-center text-[11px] text-slate-500 dark:border-slate-700/80 dark:text-slate-600">
+                  暂无；从下方分组拖入可移回此处
+                </p>
+              )}
+            </div>
+          </section>
         )}
-        {namedGroups.map((g) => {
+
+        {namedGroups.map((g, groupIndex) => {
           const list = sessionsByGroup.get(g.id) ?? [];
           const folderOpen = expandedGroupIds.has(g.id);
+          const sessionOver = sessionDropTargetId === g.id;
           return (
             <section
               key={g.id}
-              className="overflow-hidden rounded-xl border border-slate-200 bg-white/90 shadow-sm dark:border-slate-800/90 dark:bg-slate-900/40 dark:shadow-none"
+              className={`overflow-hidden rounded-xl border bg-white/90 shadow-sm transition-colors dark:bg-slate-900/40 dark:shadow-none ${
+                sessionOver
+                  ? "border-sky-500 ring-2 ring-sky-500/40 dark:border-sky-600"
+                  : "border-slate-200 dark:border-slate-800/90"
+              }`}
+              onDragOver={(e) => {
+                if (e.dataTransfer.types.includes(MIME_SESSION)) {
+                  e.preventDefault();
+                }
+              }}
+              onDragEnter={(e) => {
+                if (e.dataTransfer.types.includes(MIME_SESSION)) {
+                  setSessionDropTargetId(g.id);
+                }
+              }}
+              onDragLeave={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                  setSessionDropTargetId((cur) =>
+                    cur === g.id ? null : cur,
+                  );
+                }
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setSessionDropTargetId(null);
+                const sid = e.dataTransfer.getData(MIME_SESSION);
+                if (sid) void moveSessionToGroup(sid, g.id);
+              }}
             >
-              <button
-                type="button"
-                onClick={() => toggleGroup(g.id)}
-                className="flex w-full items-center gap-2 px-3 py-2.5 text-left transition-colors hover:bg-slate-100/90 dark:hover:bg-slate-800/40"
-              >
-                {folderOpen ? (
-                  <ChevronDown className="size-4 shrink-0 text-slate-500" />
+              <div className="flex items-center gap-0.5 border-b border-slate-200 px-1.5 py-1 dark:border-slate-800/80">
+                <div className="flex shrink-0 flex-col justify-center gap-px py-0.5">
+                  <button
+                    type="button"
+                    disabled={groupIndex === 0}
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      void moveNamedGroup(g.id, "up");
+                    }}
+                    className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-slate-800 disabled:pointer-events-none disabled:opacity-25 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+                    title="上移分组"
+                  >
+                    <ChevronUp className="size-3.5" strokeWidth={2.5} />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={groupIndex >= namedGroups.length - 1}
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      void moveNamedGroup(g.id, "down");
+                    }}
+                    className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-slate-800 disabled:pointer-events-none disabled:opacity-25 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+                    title="下移分组"
+                  >
+                    <ChevronDown className="size-3.5" strokeWidth={2.5} />
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => toggleGroup(g.id)}
+                  className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-1.5 pl-1 pr-2 text-left transition-colors hover:bg-slate-100/90 dark:hover:bg-slate-800/40"
+                >
+                  {folderOpen ? (
+                    <ChevronDown className="size-4 shrink-0 text-slate-500" />
+                  ) : (
+                    <ChevronRight className="size-4 shrink-0 text-slate-500" />
+                  )}
+                  <Folder className="size-4 shrink-0 text-sky-600 dark:text-sky-500/90" />
+                  <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-800 dark:text-slate-200">
+                    {g.name}
+                  </span>
+                  <span className="shrink-0 rounded-md bg-slate-200 px-1.5 py-0.5 text-[10px] tabular-nums text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+                    {list.length}
+                  </span>
+                </button>
+                {groupDeletePromptId === g.id ? (
+                  <div className="flex shrink-0 flex-col items-end gap-1 py-0.5 pl-1">
+                    <p className="max-w-[7.5rem] text-right text-[9px] leading-snug text-red-700 dark:text-red-400/90">
+                      {list.length > 0
+                        ? `删除「${g.name}」及 ${list.length} 条会话？`
+                        : `删除空分组「${g.name}」？`}
+                    </p>
+                    <div className="flex gap-1">
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          cancelDeleteGroupPrompt();
+                        }}
+                        className="rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[9px] text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          void confirmDeleteGroup(g);
+                        }}
+                        className="rounded bg-red-600 px-1.5 py-0.5 text-[9px] font-medium text-white hover:bg-red-500"
+                      >
+                        确定删除
+                      </button>
+                    </div>
+                  </div>
                 ) : (
-                  <ChevronRight className="size-4 shrink-0 text-slate-500" />
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      setGroupDeletePromptId(g.id);
+                    }}
+                    className="shrink-0 rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/40 dark:hover:text-red-400"
+                    title="删除分组及组内全部会话"
+                  >
+                    <Trash2 className="size-4" aria-hidden />
+                  </button>
                 )}
-                <Folder className="size-4 shrink-0 text-sky-600 dark:text-sky-500/90" />
-                <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-800 dark:text-slate-200">
-                  {g.name}
-                </span>
-                <span className="shrink-0 rounded-md bg-slate-200 px-1.5 py-0.5 text-[10px] tabular-nums text-slate-600 dark:bg-slate-800 dark:text-slate-400">
-                  {list.length}
-                </span>
-              </button>
+              </div>
               {folderOpen && (
-                <div className="space-y-1.5 border-t border-slate-200 px-2 pb-2 pt-1 dark:border-slate-800/80">
+                <div className="space-y-1.5 px-2 pb-2 pt-1">
                   {list.length === 0 ? (
                     <p className="px-2 py-3 text-center text-[11px] text-slate-500 dark:text-slate-600">
-                      该分组下暂无会话
+                      拖入会话到此处或本分组标题
                     </p>
                   ) : (
                     list.map(renderSessionCard)
@@ -800,35 +1029,6 @@ export function App() {
             </section>
           );
         })}
-
-        {groups.filter((g) => g.id !== UNGROUPED_ID).length > 0 && (
-          <section className="pt-2">
-            <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-slate-500 dark:text-slate-600">
-              管理分组
-            </h3>
-            <ul className="space-y-1">
-              {groups
-                .filter((g) => g.id !== UNGROUPED_ID)
-                .map((g) => (
-                  <li
-                    key={g.id}
-                    className="flex items-center justify-between rounded-lg border border-transparent bg-slate-100/80 px-2 py-1.5 text-xs dark:border-transparent dark:bg-slate-900/40"
-                  >
-                    <span className="text-slate-600 dark:text-slate-400">
-                      {g.name}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => onDeleteGroup(g)}
-                      className="text-[10px] text-red-600 hover:text-red-500 dark:text-red-500/80 dark:hover:text-red-400"
-                    >
-                      删除
-                    </button>
-                  </li>
-                ))}
-            </ul>
-          </section>
-        )}
       </main>
 
       {toast && (
