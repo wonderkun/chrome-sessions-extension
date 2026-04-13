@@ -1,5 +1,6 @@
 /**
- * 标签导航 / 切换时：若当前 URL 仅匹配一条已保存会话，则自动写入该会话 Cookie。
+ * 标签变为前台（activated）时：若 boundTabId 命中且与会话 url 同源，则写入该会话 Cookie。
+ * 不在每次 URL 加载（onUpdated loading）时注入，避免同标签内导航重复写 Cookie。
  * 不引用 ../lib，与 keepalive 一样保证 SW 单文件打包。
  */
 const SESSIONS_KEY = "sessions_v1";
@@ -22,19 +23,17 @@ type SessionRow = {
   id: string;
   url: string;
   cookies: StoredCookie[];
+  boundTabId?: number;
 };
 
 let autoApplyEnabled = true;
 let prefsReady = false;
 
-function normalizeUrl(urlStr: string): string {
+function sameOrigin(a: string, b: string): boolean {
   try {
-    const u = new URL(urlStr);
-    u.hash = "";
-    return u.href;
+    return new URL(a).origin === new URL(b).origin;
   } catch {
-    const i = urlStr.indexOf("#");
-    return i === -1 ? urlStr : urlStr.slice(0, i);
+    return false;
   }
 }
 
@@ -89,21 +88,38 @@ async function loadSessions(): Promise<SessionRow[]> {
   );
 }
 
-function uniqueSessionForUrl(
+function sessionForBoundTab(
   sessions: SessionRow[],
+  tabId: number,
   tabUrl: string,
 ): SessionRow | null {
   if (!tabUrl.startsWith("http")) return null;
-  const norm = normalizeUrl(tabUrl);
-  const hits = sessions.filter((s) => normalizeUrl(s.url) === norm);
-  if (hits.length !== 1) return null;
+  const hits = sessions.filter(
+    (s) =>
+      s.boundTabId === tabId &&
+      typeof s.url === "string" &&
+      sameOrigin(tabUrl, s.url),
+  );
+  if (hits.length === 0) return null;
+  if (hits.length > 1) {
+    hits.sort((a, b) => a.id.localeCompare(b.id));
+    console.warn(
+      "[autoApply] multiple sessions bound to tab",
+      tabId,
+      "using",
+      hits[0]!.id,
+    );
+  }
   return hits[0]!;
 }
 
-async function tryAutoApplyForUrl(tabUrl: string): Promise<void> {
+async function tryAutoApplyForTab(
+  tabId: number,
+  tabUrl: string,
+): Promise<void> {
   if (!(await loadPrefsFlag())) return;
   const sessions = await loadSessions();
-  const session = uniqueSessionForUrl(sessions, tabUrl);
+  const session = sessionForBoundTab(sessions, tabId, tabUrl);
   if (!session) return;
   await applySessionCookies(session);
 }
@@ -120,18 +136,11 @@ export function registerAutoApplyCookies(): void {
     }
   });
 
-  chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-    if (changeInfo.status !== "loading") return;
-    const url = changeInfo.url ?? tab.url;
-    if (!url?.startsWith("http")) return;
-    void tryAutoApplyForUrl(url);
-  });
-
   chrome.tabs.onActivated.addListener((activeInfo) => {
     void chrome.tabs.get(activeInfo.tabId).then((t) => {
       const url = t.url;
       if (!url?.startsWith("http")) return;
-      void tryAutoApplyForUrl(url);
+      void tryAutoApplyForTab(activeInfo.tabId, url);
     });
   });
 }

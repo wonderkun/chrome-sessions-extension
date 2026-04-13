@@ -1,10 +1,12 @@
 import { registerAutoApplyCookies } from "./autoApplyCookies";
+import { registerBoundTabCleanupOnRemoved } from "./boundTabOnRemoved";
 import {
   runKeepaliveForAllSessions,
   runKeepaliveForSessionId,
 } from "./keepalive";
 
 registerAutoApplyCookies();
+registerBoundTabCleanupOnRemoved();
 
 const ALARM_KEEPALIVE = "session-keepalive";
 

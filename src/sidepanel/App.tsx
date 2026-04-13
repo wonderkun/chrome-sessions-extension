@@ -2,6 +2,7 @@ import {
   BookmarkPlus,
   ChevronDown,
   ChevronRight,
+  Eraser,
   ExternalLink,
   Folder,
   FolderInput,
@@ -15,7 +16,10 @@ import {
   resolveCaptureGroupId,
   sessionDisplayTitle,
 } from "../lib/aliyun";
-import { captureCookiesForUrl } from "../lib/cookies";
+import {
+  captureCookiesForUrl,
+  clearCookiesForPageUrl,
+} from "../lib/cookies";
 import {
   ensureGroupId,
   loadGroups,
@@ -40,6 +44,7 @@ export function App() {
   const [groups, setGroups] = useState<Group[]>([]);
   const [loading, setLoading] = useState(true);
   const [captureBusy, setCaptureBusy] = useState(false);
+  const [clearSiteBusy, setClearSiteBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [newGroupOpen, setNewGroupOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
@@ -174,11 +179,16 @@ export function App() {
         showToast("请在普通网页标签页中采集（不支持扩展页等）");
         return;
       }
+      if (tab.id == null) {
+        showToast("无法读取标签页 id，请重试");
+        return;
+      }
+      const tabId = tab.id;
       const cookies = await captureCookiesForUrl(tab.url);
       let aliyunAccountName: string | undefined;
-      if (tab.id != null && isAliyunPageUrl(tab.url)) {
+      if (isAliyunPageUrl(tab.url)) {
         try {
-          const r = (await chrome.tabs.sendMessage(tab.id, {
+          const r = (await chrome.tabs.sendMessage(tabId, {
             type: "GET_ALIYUN_ACCOUNT_NAME",
           })) as { name?: string };
           const n = r?.name?.trim();
@@ -195,27 +205,65 @@ export function App() {
         setGroups(g2);
         await saveGroups(g2);
       }
-      const session: Session = {
-        id: newSessionId(),
-        title: inferCapturedTitle(tab.url, tab.title || ""),
+
+      const boundIdx = sessions.findIndex((s) => s.boundTabId === tabId);
+      const title = inferCapturedTitle(tab.url, tab.title || "");
+      const baseFields = {
         url: tab.url,
         faviconUrl: tab.favIconUrl || "",
         cookies,
         groupId,
-        createdAt: Date.now(),
-        keepaliveEnabled: true,
+        keepaliveEnabled: true as const,
+        boundTabId: tabId,
         ...(aliyunAccountName ? { aliyunAccountName } : {}),
       };
-      const next = [session, ...sessions];
+
+      let next: Session[];
+      if (boundIdx >= 0) {
+        const prev = sessions[boundIdx]!;
+        const updated: Session = {
+          ...prev,
+          ...baseFields,
+          title,
+        };
+        next = sessions.map((s, i) => {
+          if (i === boundIdx) return updated;
+          if (s.boundTabId === tabId) {
+            const { boundTabId: _b, ...rest } = s;
+            return rest as Session;
+          }
+          return s;
+        });
+      } else {
+        const session: Session = {
+          id: newSessionId(),
+          title,
+          createdAt: Date.now(),
+          ...baseFields,
+        };
+        next = [
+          session,
+          ...sessions.map((s) =>
+            s.boundTabId === tabId
+              ? (() => {
+                  const { boundTabId: _b, ...rest } = s;
+                  return rest as Session;
+                })()
+              : s,
+          ),
+        ];
+      }
+
       setSessions(next);
       await saveSessions(next);
       const base =
         cookies.length > 0
-          ? `已采集「${session.title}」· ${cookies.length} 条 Cookie`
-          : `已采集「${session.title}」（未检测到 Cookie，仍可保存书签）`;
+          ? `已采集「${title}」· ${cookies.length} 条 Cookie`
+          : `已采集「${title}」（未检测到 Cookie，仍可保存书签）`;
       const extra: string[] = [];
       if (autoHint) extra.push(`已归入「${autoHint}」`);
       if (aliyunAccountName) extra.push(`主账号：${aliyunAccountName}`);
+      if (boundIdx >= 0) extra.push("已更新当前标签绑定的会话");
       showToast(extra.length ? `${base} · ${extra.join(" · ")}` : base);
     } catch (e) {
       console.error(e);
@@ -225,9 +273,59 @@ export function App() {
     }
   };
 
+  const onClearSiteLogin = async () => {
+    const tab = await getActiveTab();
+    if (!tab?.url?.startsWith("http")) {
+      showToast("请在普通网页标签页中使用（不支持扩展页等）");
+      return;
+    }
+    if (tab.id == null) {
+      showToast("无法读取标签页 id，请重试");
+      return;
+    }
+    const msg =
+      "将删除当前标签页 URL 下、浏览器里与此页相关的全部 Cookie（与「采集」相同的匹配范围）。\n\n" +
+      "注意：Cookie 在同一 Chrome 用户下是全局共享的，同一站点其它标签也会失去登录态；侧栏里已保存的会话不会丢失，可对原账号会话再点「打开」写回 Cookie。\n\n" +
+      "确定继续？";
+    if (!confirm(msg)) return;
+
+    setClearSiteBusy(true);
+    try {
+      const { removed, failed } = await clearCookiesForPageUrl(tab.url);
+      await chrome.tabs.reload(tab.id);
+      const tail =
+        failed > 0 ? `，${failed} 条未能删除（权限或浏览器限制）` : "";
+      showToast(`已清除 ${removed} 条 Cookie 并刷新页面${tail}`);
+    } catch (e) {
+      console.error(e);
+      showToast("清除失败，请检查扩展权限");
+    } finally {
+      setClearSiteBusy(false);
+    }
+  };
+
   const onOpen = async (s: Session) => {
     try {
-      await openOrRefreshSession(s);
+      const patch = await openOrRefreshSession(s);
+      if ("boundTabId" in patch) {
+        const v = patch.boundTabId;
+        const next = sessions.map((x) => {
+          if (x.id === s.id) {
+            if (v === null) {
+              const { boundTabId: _bt, ...rest } = x;
+              return rest as Session;
+            }
+            return { ...x, boundTabId: v };
+          }
+          if (typeof v === "number" && x.boundTabId === v) {
+            const { boundTabId: _bt, ...rest } = x;
+            return rest as Session;
+          }
+          return x;
+        });
+        setSessions(next);
+        await saveSessions(next);
+      }
       showToast("已应用会话并打开页面");
     } catch (e) {
       console.error(e);
@@ -551,8 +649,8 @@ export function App() {
   return (
     <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
       <header className="sticky top-0 z-10 border-b border-slate-200 bg-slate-50/95 px-4 py-3 backdrop-blur-sm dark:border-slate-800/80 dark:bg-slate-950/95">
-        <div className="flex items-center justify-between gap-2">
-          <div>
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 shrink pt-0.5">
             <h1 className="text-base font-semibold tracking-tight text-slate-900 dark:text-white">
               账号会话
             </h1>
@@ -560,21 +658,37 @@ export function App() {
               采集 Cookie · 分组 · 一键切换
             </p>
           </div>
-          <div className="flex flex-col items-end gap-1.5">
-            <button
-              type="button"
-              onClick={onCapture}
-              disabled={captureBusy}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-2 text-xs font-medium text-white shadow-lg shadow-sky-900/20 hover:bg-sky-500 disabled:opacity-50 dark:shadow-sky-900/30"
-            >
-              <BookmarkPlus className="size-4 shrink-0" />
-              {captureBusy ? "采集中…" : "采集当前页"}
-            </button>
+          <div className="flex min-w-0 flex-1 flex-col items-stretch gap-1.5 sm:max-w-[min(100%,17.5rem)]">
+            <div className="grid w-full grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                onClick={onCapture}
+                disabled={captureBusy || clearSiteBusy}
+                className="inline-flex min-w-0 items-center justify-center gap-1 rounded-lg bg-sky-600 px-2 py-2 text-[11px] font-medium leading-tight text-white shadow-md shadow-sky-900/20 hover:bg-sky-500 disabled:opacity-50 sm:gap-1.5 sm:px-2.5 sm:text-xs dark:shadow-sky-900/30"
+              >
+                <BookmarkPlus className="size-3.5 shrink-0 sm:size-4" />
+                <span className="text-center">
+                  {captureBusy ? "采集中…" : "采集当前页"}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={onClearSiteLogin}
+                disabled={clearSiteBusy || captureBusy}
+                title="删除当前页相关 Cookie 并刷新，便于同站重新登录另一账号（不点网站注销）"
+                className="inline-flex min-w-0 items-center justify-center gap-1 rounded-lg border border-amber-600/70 bg-white px-2 py-2 text-[11px] font-medium leading-tight text-amber-900 hover:bg-amber-50 disabled:opacity-50 sm:gap-1.5 sm:px-2.5 sm:text-xs dark:border-amber-500/60 dark:bg-slate-900 dark:text-amber-100 dark:hover:bg-amber-950/40"
+              >
+                <Eraser className="size-3.5 shrink-0 sm:size-4" />
+                <span className="text-center">
+                  {clearSiteBusy ? "清除中…" : "清除站登录态"}
+                </span>
+              </button>
+            </div>
             <button
               type="button"
               onClick={onKeepaliveAll}
               disabled={pingingAll || sessions.length === 0}
-              className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2 py-1 text-[10px] text-slate-700 hover:bg-slate-100 disabled:opacity-40 dark:border-slate-600 dark:bg-slate-800/80 dark:text-slate-300 dark:hover:bg-slate-700"
+              className="inline-flex items-center justify-center gap-1 self-end rounded-md border border-slate-300 bg-white px-2 py-1 text-[10px] text-slate-700 hover:bg-slate-100 disabled:opacity-40 dark:border-slate-600 dark:bg-slate-800/80 dark:text-slate-300 dark:hover:bg-slate-700"
               title="按顺序对全部启用保活的会话执行一次刷登录（与定时任务无关）"
             >
               <RefreshCw
@@ -608,8 +722,8 @@ export function App() {
             }}
           />
           <span>
-            进入已保存的页面时自动写入 Cookie（与「打开」相同比对规则，忽略
-            #；同一地址存在多条会话时不自动，避免串号）
+            切换到前台时，若当前标签已与会话绑定且页面同源，则自动写入该会话
+            Cookie（同标签内继续浏览不会重复注入）
           </span>
         </label>
 

@@ -27,6 +27,8 @@ export type Session = {
   keepaliveLastError?: string;
   /** 阿里云页采集时尽力解析的账号显示名（主账号/登录名等） */
   aliyunAccountName?: string;
+  /** 采集/打开时绑定的标签 id；无则不走按标签的自动注入 */
+  boundTabId?: number;
 };
 
 export type Group = {
