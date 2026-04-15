@@ -104,6 +104,16 @@ export function App() {
     );
   }, []);
 
+  /** 通知后台本窗口侧栏已展示，便于浮标「再点关闭」在 SW 重启后仍能识别为已打开 */
+  useEffect(() => {
+    void chrome.windows.getCurrent().then((w) => {
+      chrome.runtime.sendMessage(
+        { type: "SIDE_PANEL_MARK_OPEN", windowId: w.id },
+        () => void chrome.runtime.lastError,
+      );
+    });
+  }, []);
+
   useEffect(() => {
     const onStorage = (
       changes: Record<string, chrome.storage.StorageChange>,
