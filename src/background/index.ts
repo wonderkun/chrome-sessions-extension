@@ -1,6 +1,11 @@
 import { registerAutoApplyCookies } from "./autoApplyCookies";
 import { registerBoundTabCleanupOnRemoved } from "./boundTabOnRemoved";
 import {
+  EXTENSION_PREFS_STORAGE_KEY,
+  getKeepaliveAlarmPeriodMinutes,
+  loadExtensionPrefs,
+} from "../lib/prefs";
+import {
   runKeepaliveForAllSessions,
   runKeepaliveForSessionId,
 } from "./keepalive";
@@ -9,6 +14,12 @@ registerAutoApplyCookies();
 registerBoundTabCleanupOnRemoved();
 
 const ALARM_KEEPALIVE = "session-keepalive";
+
+async function syncKeepaliveAlarmFromPrefs(): Promise<void> {
+  const p = await loadExtensionPrefs();
+  const periodInMinutes = getKeepaliveAlarmPeriodMinutes(p);
+  await chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes });
+}
 
 /** 本扩展侧栏在当前窗口是否处于打开（用于浮标点击切换；依赖 onOpened/onClosed，侧栏页也会上报以修复 SW 休眠丢状态） */
 const sidePanelOpenWindowIds = new Set<number>();
@@ -39,11 +50,24 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: true })
     .catch((err) => console.warn("sidePanel behavior:", err));
-  chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 180 });
+  void syncKeepaliveAlarmFromPrefs().catch((e) =>
+    console.warn("[keepalive] sync alarm onInstalled", e),
+  );
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 180 });
+  void syncKeepaliveAlarmFromPrefs().catch((e) =>
+    console.warn("[keepalive] sync alarm onStartup", e),
+  );
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes[EXTENSION_PREFS_STORAGE_KEY]) {
+    void syncKeepaliveAlarmFromPrefs().catch((e) =>
+      console.warn("[keepalive] sync alarm on prefs change", e),
+    );
+  }
 });
 
 chrome.alarms.onAlarm.addListener((a) => {

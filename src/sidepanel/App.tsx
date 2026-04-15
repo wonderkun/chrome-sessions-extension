@@ -33,8 +33,16 @@ import {
 import type { Group, Session } from "../lib/types";
 import { DEFAULT_GROUPS, UNGROUPED_ID } from "../lib/types";
 import {
+  DEFAULT_KEEPALIVE_ALARM_PERIOD_MINUTES,
+  MAX_KEEPALIVE_ALARM_PERIOD_MINUTES,
+  MIN_KEEPALIVE_ALARM_PERIOD_MINUTES,
+  clampKeepaliveAlarmPeriodMinutes,
+  formatKeepalivePeriodForUi,
+} from "../lib/keepalivePeriod";
+import {
   EXTENSION_PREFS_STORAGE_KEY,
   type ExtensionPrefs,
+  getKeepaliveAlarmPeriodMinutes,
   isAutoApplyCookiesEnabled,
   loadExtensionPrefs,
   saveExtensionPrefs,
@@ -67,6 +75,8 @@ export function App() {
   /** 上一次已知的分组 id 集合，用于仅在「新增分组」时自动展开，避免重排/刷新把已折叠的组全打开 */
   const prevGroupIdsRef = useRef<Set<string> | null>(null);
   const [autoApplyCookies, setAutoApplyCookies] = useState(true);
+  const [keepaliveAlarmPeriodMinutes, setKeepaliveAlarmPeriodMinutes] =
+    useState(DEFAULT_KEEPALIVE_ALARM_PERIOD_MINUTES);
   /** 双击标题内联编辑 */
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
   const [titleDraft, setTitleDraft] = useState("");
@@ -99,9 +109,10 @@ export function App() {
   }, [refresh]);
 
   useEffect(() => {
-    void loadExtensionPrefs().then((p) =>
-      setAutoApplyCookies(isAutoApplyCookiesEnabled(p)),
-    );
+    void loadExtensionPrefs().then((p) => {
+      setAutoApplyCookies(isAutoApplyCookiesEnabled(p));
+      setKeepaliveAlarmPeriodMinutes(getKeepaliveAlarmPeriodMinutes(p));
+    });
   }, []);
 
   /** 通知后台本窗口侧栏已展示，便于浮标「再点关闭」在 SW 重启后仍能识别为已打开 */
@@ -126,6 +137,7 @@ export function App() {
           .newValue as ExtensionPrefs | undefined;
         if (nv && typeof nv === "object") {
           setAutoApplyCookies(isAutoApplyCookiesEnabled(nv));
+          setKeepaliveAlarmPeriodMinutes(getKeepaliveAlarmPeriodMinutes(nv));
         }
       }
     };
@@ -664,7 +676,7 @@ export function App() {
                   })
                 }
               />
-              定时刷登录（约每 3 小时请求一次，延长登录态）
+              {`定时刷登录（${formatKeepalivePeriodForUi(keepaliveAlarmPeriodMinutes)}由后台请求一次，延长登录态）`}
             </label>
             <input
               type="url"
@@ -821,6 +833,34 @@ export function App() {
             Cookie（同标签内继续浏览不会重复注入）
           </span>
         </label>
+
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-slate-600 dark:text-slate-400">
+          <span className="shrink-0">定时保活间隔（全局）</span>
+          <input
+            type="number"
+            min={MIN_KEEPALIVE_ALARM_PERIOD_MINUTES}
+            max={MAX_KEEPALIVE_ALARM_PERIOD_MINUTES}
+            step={1}
+            value={keepaliveAlarmPeriodMinutes}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              if (!Number.isFinite(n)) return;
+              setKeepaliveAlarmPeriodMinutes(n);
+            }}
+            onBlur={async () => {
+              const c = clampKeepaliveAlarmPeriodMinutes(
+                keepaliveAlarmPeriodMinutes,
+              );
+              setKeepaliveAlarmPeriodMinutes(c);
+              await saveExtensionPrefs({ keepaliveAlarmPeriodMinutes: c });
+            }}
+            className="w-[4.5rem] rounded-md border border-slate-300 bg-white px-1.5 py-1 text-[11px] text-slate-800 tabular-nums focus:border-sky-500 focus:outline-none dark:border-slate-600 dark:bg-slate-950 dark:text-slate-200 dark:focus:border-sky-600"
+          />
+          <span className="text-slate-500 dark:text-slate-500">
+            分钟 · {formatKeepalivePeriodForUi(keepaliveAlarmPeriodMinutes)}
+            （失焦后保存并更新后台闹钟）
+          </span>
+        </div>
 
         {newGroupOpen && (
           <div className="mt-2 flex gap-2 rounded-lg border border-slate-200 bg-white p-2 dark:border-slate-800 dark:bg-slate-900/80">
